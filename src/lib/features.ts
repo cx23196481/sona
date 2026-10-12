@@ -49,6 +49,7 @@ import {
   shouldSkipSonaStrengthGame,
   type SonaPlayerStrengthScore,
 } from '@/lib/player-strength-score'
+import { deobfuscateChampSelectPuuid } from '@/lib/champ-select-puuid'
 import { translate } from '@/i18n'
 
 // ==================== 共享：查询队友胜率 ====================
@@ -59,6 +60,8 @@ interface TeammateStats {
   floor: number
   summonerId: number
   puuid: string
+  obfuscatedSummonerId: number
+  obfuscatedPuuid: string
   gameName: string
   tagLine: string
   winRate: number | null  // null = 查询失败或无战绩
@@ -78,16 +81,31 @@ interface TeamStatsResult {
   fetchCount: number
 }
 
-function getPlayerStatsKey(player: Pick<ChampSelectTeamPlayer, 'puuid' | 'summonerId' | 'cellId'>): string {
+function getPlayerStatsKey(player: Pick<ChampSelectTeamPlayer, 'puuid' | 'summonerId' | 'obfuscatedPuuid' | 'obfuscatedSummonerId' | 'cellId'>): string {
   if (player.puuid) return `puuid:${player.puuid}`
   if (player.summonerId) return `summoner:${player.summonerId}`
+  if (player.obfuscatedPuuid) return `obfuscated-puuid:${player.obfuscatedPuuid}`
+  if (player.obfuscatedSummonerId) return `obfuscated-summoner:${player.obfuscatedSummonerId}`
   return `cell:${player.cellId}`
 }
 
 function getTeammateStatsKey(stat: TeammateStats): string {
+  // 匿名模式下优先使用会话中的混淆 ID，换楼后仍可与最新 session 稳定对应。
+  if (stat.obfuscatedPuuid) return `obfuscated-puuid:${stat.obfuscatedPuuid}`
+  if (stat.obfuscatedSummonerId) return `obfuscated-summoner:${stat.obfuscatedSummonerId}`
   if (stat.puuid) return `puuid:${stat.puuid}`
   if (stat.summonerId) return `summoner:${stat.summonerId}`
   return `floor:${stat.floor}`
+}
+
+/**
+ * 正常模式直接使用 puuid；匿名模式则还原 obfuscatedPuuid。
+ * 只处理 HIDDEN，避免未来客户端引入其他可见性类型时误判。
+ */
+function resolveChampSelectPuuid(player: ChampSelectTeamPlayer): string {
+  if (player.puuid) return player.puuid
+  if (player.nameVisibilityType !== 'HIDDEN' || !player.obfuscatedPuuid) return ''
+  return deobfuscateChampSelectPuuid(player.obfuscatedPuuid)
 }
 
 /** 去重：同一个 ChampSelect 阶段多个功能需要同一份数据时，复用同一轮请求 */
@@ -129,13 +147,20 @@ async function _doFetchTeamStats(): Promise<TeamStatsResult> {
     store.get('analyzeTeamPowerFetchCount') || 50,
   )
 
-  /** 构造占位元素：主播模式下队友 puuid 为空，无法查询战绩 */
-  const placeholder = (player: ChampSelectTeamPlayer, i: number): TeammateStats => ({
+  /** 构造占位元素：查询失败时仍保留身份信息，供弹窗标题与换楼匹配使用 */
+  const placeholder = (
+    player: ChampSelectTeamPlayer,
+    i: number,
+    resolvedPuuid = resolveChampSelectPuuid(player),
+    resolvedIdentity?: { summonerId?: number; gameName?: string; tagLine?: string },
+  ): TeammateStats => ({
     floor: i + 1,
-    summonerId: player.summonerId,
-    puuid: player.puuid,
-    gameName: player.gameName,
-    tagLine: player.tagLine,
+    summonerId: resolvedIdentity?.summonerId || player.summonerId,
+    puuid: resolvedPuuid,
+    obfuscatedSummonerId: player.obfuscatedSummonerId,
+    obfuscatedPuuid: player.obfuscatedPuuid,
+    gameName: resolvedIdentity?.gameName || player.gameName,
+    tagLine: resolvedIdentity?.tagLine || player.tagLine,
     winRate: null,
     wins: 0,
     total: 0,
@@ -148,23 +173,47 @@ async function _doFetchTeamStats(): Promise<TeamStatsResult> {
 
   // 跳过查不到数据的占位玩家（斗魂模式 myTeam 含空位），其余保留占位以对齐楼层索引
   const analyzablePlayers = getAnalyzableTeamPlayers(session)
+  const hiddenPlayers = analyzablePlayers.filter((player) => player.nameVisibilityType === 'HIDDEN' && !player.puuid)
+  if (hiddenPlayers.length > 0) {
+    const resolvedCount = hiddenPlayers.filter((player) => Boolean(resolveChampSelectPuuid(player))).length
+    logger.info('[TeamStats] 匿名模式身份还原: %d/%d', resolvedCount, hiddenPlayers.length)
+  }
+
   const stats = await Promise.all(analyzablePlayers.map(async (player, i) => {
-    // 主播模式下队友 puuid 为空（但有 obfuscatedPuuid），跳过查询，直接返回占位
-    if (!player.puuid) {
-      return placeholder(player, i)
+    const puuid = resolveChampSelectPuuid(player)
+    if (!puuid) {
+      logger.warn('[TeamStats] %d楼缺少可查询的 PUUID（visibility=%s）', i + 1, player.nameVisibilityType || 'unknown')
+      return placeholder(player, i, '')
     }
 
-    try {
-      const puuid = player.puuid
-      const gameName = player.gameName
-      const tagLine = player.tagLine
+    const needsIdentityBackfill = !player.gameName || !player.tagLine || !player.summonerId
+    // 匿名模式的 ChampSelectSession 会清空 Riot ID；用已还原的真实 PUUID 从 Summoner 接口回填。
+    const identityPromise = needsIdentityBackfill
+      ? lcu.getSummonerByPuuid(puuid).catch((error) => {
+          logger.warn('[TeamStats] %d楼 Riot ID 回填失败:', i + 1, error)
+          return null
+        })
+      : Promise.resolve(null)
 
-      // SGP 查询，tag 参数由服务端过滤
-      const resp = await lcu.getSgpMatchHistory(puuid, {
-        startIndex: 0,
-        count: FETCH_COUNT,
-        tag: tag || undefined,
-      })
+    try {
+      // 与 SGP 并行请求，避免给队友战力分析增加串行等待时间。
+      const [resp, summoner] = await Promise.all([
+        lcu.getSgpMatchHistory(puuid, {
+          startIndex: 0,
+          count: FETCH_COUNT,
+          tag: tag || undefined,
+        }),
+        identityPromise,
+      ])
+      const gameName = player.gameName || summoner?.gameName || summoner?.displayName || ''
+      const tagLine = player.tagLine || summoner?.tagLine || ''
+      const summonerId = player.summonerId || summoner?.summonerId || 0
+      const resolvedIdentity = { summonerId, gameName, tagLine }
+
+      if (needsIdentityBackfill && gameName) {
+        logger.info('[TeamStats] %d楼匿名 Riot ID 回填成功 → %s%s', i + 1, gameName, tagLine ? `#${tagLine}` : '')
+      }
+
       const receivedGames = resp.games ?? []
       const games = filterSonaStrengthGamesByQueue(receivedGames, currentQueueId)
 
@@ -184,7 +233,7 @@ async function _doFetchTeamStats(): Promise<TeamStatsResult> {
       }
 
       if (matchStats.length === 0) {
-        return placeholder(player, i)
+        return placeholder(player, i, puuid, resolvedIdentity)
       }
 
       let wins = 0, totalKills = 0, totalDeaths = 0, totalAssists = 0
@@ -208,8 +257,10 @@ async function _doFetchTeamStats(): Promise<TeamStatsResult> {
 
       return {
         floor: i + 1,
-        summonerId: player.summonerId,
+        summonerId,
         puuid,
+        obfuscatedSummonerId: player.obfuscatedSummonerId,
+        obfuscatedPuuid: player.obfuscatedPuuid,
         gameName,
         tagLine,
         winRate: (wins / total) * 100,
@@ -221,8 +272,15 @@ async function _doFetchTeamStats(): Promise<TeamStatsResult> {
         kdaNum: totalDeaths === 0 ? totalKills + totalAssists : (totalKills + totalAssists) / totalDeaths,
         strengthScore,
       } as TeammateStats
-    } catch {
-      return placeholder(player, i)
+    } catch (error) {
+      logger.warn('[TeamStats] %d楼战绩查询失败（visibility=%s）:', i + 1, player.nameVisibilityType || 'unknown', error)
+      // 即使 SGP 失败，也等待已发出的 Summoner 请求，以免弹窗标题和日志再次丢失名字。
+      const summoner = await identityPromise
+      return placeholder(player, i, puuid, {
+        summonerId: player.summonerId || summoner?.summonerId || 0,
+        gameName: player.gameName || summoner?.gameName || summoner?.displayName || '',
+        tagLine: player.tagLine || summoner?.tagLine || '',
+      })
     }
   }))
 
@@ -240,6 +298,11 @@ const SONA_TIER_ATTR = 'data-sona-tier'
 const SONA_STATS_ATTR = 'data-sona-stats'
 const SONA_CLICK_ATTR = 'data-sona-click'
 const SONA_PLAYER_KEY_ATTR = 'data-sona-player-key'
+const SONA_HIDDEN_NAME_ATTR = 'data-sona-hidden-player-name'
+const SONA_HIDDEN_NAME_KEY_ATTR = 'data-sona-hidden-player-key'
+const SONA_HIDDEN_REAL_NAME_ATTR = 'data-sona-hidden-real-name'
+const SONA_HIDDEN_NAME_SUFFIX_ATTR = 'data-sona-hidden-name-suffix'
+const SONA_HIDDEN_NAME_STYLE_ID = 'sona-hidden-player-name-style'
 
 /** 每个楼层的完整战绩缓存 */
 let floorStats: TeammateStats[] = []
@@ -247,6 +310,10 @@ let floorStats: TeammateStats[] = []
 let statsByPuuid = new Map<string, TeammateStats>()
 /** summonerId → TeammateStats 映射，用于 puuid 不可用时兜底匹配 */
 let statsBySummonerId = new Map<number, TeammateStats>()
+/** obfuscatedPuuid → TeammateStats 映射，用于匿名模式换楼后的稳定匹配 */
+let statsByObfuscatedPuuid = new Map<string, TeammateStats>()
+/** obfuscatedSummonerId → TeammateStats 映射，作为匿名模式的第二层兜底 */
+let statsByObfuscatedSummonerId = new Map<number, TeammateStats>()
 /** 当前 DOM 展示顺序签名，用于位置互换后触发重绑 */
 let currentChampSelectTeamSignature = ''
 /** 当前选人阶段的队列 ID，用于打开战绩弹窗时自动过滤 */
@@ -266,6 +333,17 @@ interface ChampSelectInjectedRef {
   clickHandler: ((e: Event) => void) | null
 }
 let champSelectInjectedRefs: ChampSelectInjectedRef[] = []
+
+/** 匿名玩家名字增强的 DOM 引用；与战绩引用分开，保证无近期战绩时也能展示真实名字 */
+interface ChampSelectHiddenNameRef {
+  nameElement: HTMLElement
+  suffixElement: HTMLSpanElement
+  playerKey: string
+  originalAlias: string
+  previousTitle: string | null
+  previousAriaLabel: string | null
+}
+let champSelectHiddenNameRefs: ChampSelectHiddenNameRef[] = []
 
 /** 战绩弹窗的独立 React root */
 let matchModalRoot: Root | null = null
@@ -301,6 +379,151 @@ function cleanupMatchModal() {
   }
 }
 
+function ensureHiddenPlayerNameStyle() {
+  if (document.getElementById(SONA_HIDDEN_NAME_STYLE_ID)) return
+
+  const style = document.createElement('style')
+  style.id = SONA_HIDDEN_NAME_STYLE_ID
+  style.textContent = `
+    .player-name-wrapper[${SONA_HIDDEN_NAME_ATTR}]::before {
+      content: attr(${SONA_HIDDEN_REAL_NAME_ATTR}) "(";
+    }
+
+    .player-name-wrapper[${SONA_HIDDEN_NAME_ATTR}] > [${SONA_HIDDEN_NAME_SUFFIX_ATTR}] {
+      display: inline-flex !important;
+      align-items: center;
+      gap: 3px;
+      vertical-align: -1px;
+      white-space: nowrap;
+      pointer-events: none;
+    }
+
+    .player-name-wrapper[${SONA_HIDDEN_NAME_ATTR}] > [${SONA_HIDDEN_NAME_SUFFIX_ATTR}] > svg {
+      width: 11px;
+      height: 11px;
+      flex: 0 0 11px;
+      color: #e6c76a !important;
+      -webkit-text-fill-color: #e6c76a !important;
+      filter: drop-shadow(0 0 3px rgba(200, 170, 110, 0.55));
+    }
+  `
+  document.head.appendChild(style)
+}
+
+function createHiddenNameSuffix(): HTMLSpanElement {
+  const suffix = document.createElement('span')
+  suffix.setAttribute(SONA_HIDDEN_NAME_SUFFIX_ATTR, 'true')
+  suffix.setAttribute('aria-hidden', 'true')
+  suffix.appendChild(document.createTextNode(')'))
+
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg')
+  svg.setAttribute('viewBox', '0 0 16 16')
+  svg.setAttribute('fill', 'none')
+  svg.setAttribute('focusable', 'false')
+
+  const shackle = document.createElementNS('http://www.w3.org/2000/svg', 'path')
+  shackle.setAttribute('d', 'M5 7V5a3 3 0 0 1 6 0v2')
+  shackle.setAttribute('stroke', 'currentColor')
+  shackle.setAttribute('stroke-width', '1.6')
+  shackle.setAttribute('stroke-linecap', 'round')
+
+  const body = document.createElementNS('http://www.w3.org/2000/svg', 'rect')
+  body.setAttribute('x', '3')
+  body.setAttribute('y', '7')
+  body.setAttribute('width', '10')
+  body.setAttribute('height', '7')
+  body.setAttribute('rx', '2')
+  body.setAttribute('fill', 'rgba(230, 199, 106, 0.18)')
+  body.setAttribute('stroke', 'currentColor')
+  body.setAttribute('stroke-width', '1.4')
+
+  const keyhole = document.createElementNS('http://www.w3.org/2000/svg', 'circle')
+  keyhole.setAttribute('cx', '8')
+  keyhole.setAttribute('cy', '10.5')
+  keyhole.setAttribute('r', '0.9')
+  keyhole.setAttribute('fill', 'currentColor')
+
+  svg.append(shackle, body, keyhole)
+  suffix.appendChild(svg)
+  return suffix
+}
+
+function readHiddenAlias(nameElement: HTMLElement, suffixElement?: HTMLElement): string {
+  return Array.from(nameElement.childNodes)
+    .filter((node) => node !== suffixElement)
+    .map((node) => node.textContent ?? '')
+    .join('')
+    .trim()
+}
+
+function cleanupHiddenNameRef(ref: ChampSelectHiddenNameRef) {
+  ref.suffixElement.remove()
+  ref.nameElement.removeAttribute(SONA_HIDDEN_NAME_ATTR)
+  ref.nameElement.removeAttribute(SONA_HIDDEN_NAME_KEY_ATTR)
+  ref.nameElement.removeAttribute(SONA_HIDDEN_REAL_NAME_ATTR)
+
+  if (ref.previousTitle == null) ref.nameElement.removeAttribute('title')
+  else ref.nameElement.setAttribute('title', ref.previousTitle)
+
+  if (ref.previousAriaLabel == null) ref.nameElement.removeAttribute('aria-label')
+  else ref.nameElement.setAttribute('aria-label', ref.previousAriaLabel)
+}
+
+function applyHiddenPlayerName(wrapper: Element, stat: TeammateStats, playerKey: string) {
+  // obfuscatedPuuid 只在客户端匿名模式下存在；公开玩家保持客户端原始显示。
+  if (!stat.obfuscatedPuuid || !stat.gameName) return
+
+  const nameElement = wrapper.querySelector('.player-name-wrapper') as HTMLElement | null
+  if (!nameElement) return
+
+  let ref = champSelectHiddenNameRefs.find((item) => item.nameElement === nameElement)
+  let created = false
+  if (ref && ref.playerKey !== playerKey) {
+    cleanupHiddenNameRef(ref)
+    champSelectHiddenNameRefs = champSelectHiddenNameRefs.filter((item) => item !== ref)
+    ref = undefined
+  }
+
+  if (!ref) {
+    const originalAlias = readHiddenAlias(nameElement)
+    if (!originalAlias) return
+
+    const suffixElement = createHiddenNameSuffix()
+    ref = {
+      nameElement,
+      suffixElement,
+      playerKey,
+      originalAlias,
+      previousTitle: nameElement.getAttribute('title'),
+      previousAriaLabel: nameElement.getAttribute('aria-label'),
+    }
+    champSelectHiddenNameRefs.push(ref)
+    created = true
+  } else {
+    const latestAlias = readHiddenAlias(nameElement, ref.suffixElement)
+    if (latestAlias) ref.originalAlias = latestAlias
+  }
+
+  // Ember 更新可能移除我们追加的尾缀；每次注入轮询都确保它位于文本末尾。
+  if (ref.suffixElement.parentElement !== nameElement) {
+    nameElement.appendChild(ref.suffixElement)
+  } else if (nameElement.lastChild !== ref.suffixElement) {
+    nameElement.appendChild(ref.suffixElement)
+  }
+
+  ensureHiddenPlayerNameStyle()
+  const fullName = `${stat.gameName}(${ref.originalAlias})`
+  nameElement.setAttribute(SONA_HIDDEN_NAME_ATTR, 'true')
+  nameElement.setAttribute(SONA_HIDDEN_NAME_KEY_ATTR, playerKey)
+  nameElement.setAttribute(SONA_HIDDEN_REAL_NAME_ATTR, stat.gameName)
+  nameElement.setAttribute('title', `${fullName} · 匿名模式`)
+  nameElement.setAttribute('aria-label', `${fullName}，匿名模式`)
+
+  if (created) {
+    logger.info('[ChampSelect] %d楼匿名名字增强 → %s', stat.floor, fullName)
+  }
+}
+
 /**
  * 过滤掉查不到数据的占位玩家：puuid 与 obfuscatedPuuid 均为空字符串。
  * 斗魂（Arena）模式所有玩家都在 myTeam（16 人）且夹杂空位占位，
@@ -319,6 +542,8 @@ function getTeamDisplaySignature(session: ChampSelectSession): string {
 function getCachedStatsForPlayer(player: ChampSelectTeamPlayer, floor: number): TeammateStats {
   const cached = (player.puuid ? statsByPuuid.get(player.puuid) : undefined)
     ?? (player.summonerId ? statsBySummonerId.get(player.summonerId) : undefined)
+    ?? (player.obfuscatedPuuid ? statsByObfuscatedPuuid.get(player.obfuscatedPuuid) : undefined)
+    ?? (player.obfuscatedSummonerId ? statsByObfuscatedSummonerId.get(player.obfuscatedSummonerId) : undefined)
 
   if (cached) {
     return {
@@ -328,13 +553,17 @@ function getCachedStatsForPlayer(player: ChampSelectTeamPlayer, floor: number): 
       tagLine: player.tagLine || cached.tagLine,
       puuid: player.puuid || cached.puuid,
       summonerId: player.summonerId || cached.summonerId,
+      obfuscatedPuuid: player.obfuscatedPuuid || cached.obfuscatedPuuid,
+      obfuscatedSummonerId: player.obfuscatedSummonerId || cached.obfuscatedSummonerId,
     }
   }
 
   return {
     floor,
     summonerId: player.summonerId,
-    puuid: player.puuid,
+    puuid: resolveChampSelectPuuid(player),
+    obfuscatedSummonerId: player.obfuscatedSummonerId,
+    obfuscatedPuuid: player.obfuscatedPuuid,
     gameName: player.gameName,
     tagLine: player.tagLine,
     winRate: null,
@@ -364,12 +593,17 @@ function tryInjectChampSelectTier(): boolean {
 
   const hasMismatchedBinding = Array.from(wrappers).some((wrapper, i) => {
     const iconContainer = wrapper.querySelector('.champion-icon-container') as HTMLElement | null
+    const nameElement = wrapper.querySelector('.player-name-wrapper') as HTMLElement | null
     const stat = floorStats[i]
-    if (!iconContainer || !stat) return false
+    if (!stat) return false
 
     const expectedKey = getTeammateStatsKey(stat)
-    const existingKey = iconContainer.getAttribute(SONA_PLAYER_KEY_ATTR)
-    return Boolean(existingKey && existingKey !== expectedKey)
+    const existingIconKey = iconContainer?.getAttribute(SONA_PLAYER_KEY_ATTR)
+    const existingNameKey = nameElement?.getAttribute(SONA_HIDDEN_NAME_KEY_ATTR)
+    return Boolean(
+      (existingIconKey && existingIconKey !== expectedKey)
+      || (existingNameKey && existingNameKey !== expectedKey),
+    )
   })
 
   if (hasMismatchedBinding) {
@@ -377,13 +611,14 @@ function tryInjectChampSelectTier(): boolean {
   }
 
   wrappers.forEach((wrapper, i) => {
-    const iconContainer = wrapper.querySelector('.champion-icon-container') as HTMLElement | null
-    if (!iconContainer) return
-
     const stat = floorStats[i]
-    if (!stat || stat.winRate == null) return
-    const winRate = stat.winRate
+    if (!stat) return
     const playerKey = getTeammateStatsKey(stat)
+    applyHiddenPlayerName(wrapper, stat, playerKey)
+
+    const iconContainer = wrapper.querySelector('.champion-icon-container') as HTMLElement | null
+    if (!iconContainer || stat.winRate == null) return
+    const winRate = stat.winRate
     iconContainer.setAttribute(SONA_PLAYER_KEY_ATTR, playerKey)
 
     // ---- 粒子特效 ----
@@ -425,7 +660,10 @@ function tryInjectChampSelectTier(): boolean {
         e.preventDefault()
         const current = floorStats.find((item) => getTeammateStatsKey(item) === boundPlayerKey)
         if (current?.puuid) {
-          showMatchHistoryModal(current.puuid, `${current.gameName}#${current.tagLine}`, currentChampSelectQueueId || undefined)
+          const riotId = current.gameName
+            ? `${current.gameName}${current.tagLine ? `#${current.tagLine}` : ''}`
+            : ''
+          showMatchHistoryModal(current.puuid, riotId, currentChampSelectQueueId || undefined)
         }
       }
       iconContainer.addEventListener('click', clickHandler, true)
@@ -497,10 +735,13 @@ function unregisterTierInjection() {
   floorStats = []
   statsByPuuid.clear()
   statsBySummonerId.clear()
+  statsByObfuscatedPuuid.clear()
+  statsByObfuscatedSummonerId.clear()
   currentChampSelectTeamSignature = ''
   currentChampSelectQueueId = 0
 
   cleanupInjectedDOM()
+  document.getElementById(SONA_HIDDEN_NAME_STYLE_ID)?.remove()
   cleanupMatchModal()
 }
 
@@ -517,9 +758,13 @@ async function applyChampSelectIconEffects() {
     // 建立 puuid → stats 映射，换楼后可用新 myTeam 顺序重建 floorStats
     statsByPuuid.clear()
     statsBySummonerId.clear()
+    statsByObfuscatedPuuid.clear()
+    statsByObfuscatedSummonerId.clear()
     for (const s of stats) {
       if (s.puuid) statsByPuuid.set(s.puuid, s)
       if (s.summonerId) statsBySummonerId.set(s.summonerId, s)
+      if (s.obfuscatedPuuid) statsByObfuscatedPuuid.set(s.obfuscatedPuuid, s)
+      if (s.obfuscatedSummonerId) statsByObfuscatedSummonerId.set(s.obfuscatedSummonerId, s)
     }
     currentChampSelectTeamSignature = stats.map(getTeammateStatsKey).join('|')
     registerTierInjection()
@@ -542,7 +787,12 @@ function onChampSelectUpdate(event: LCUEventMessage) {
   // 只处理 Update 事件
   if (event.eventType !== 'Update') return
   // 数据还没准备好就不处理
-  if (statsByPuuid.size === 0 && statsBySummonerId.size === 0) return
+  if (
+    statsByPuuid.size === 0
+    && statsBySummonerId.size === 0
+    && statsByObfuscatedPuuid.size === 0
+    && statsByObfuscatedSummonerId.size === 0
+  ) return
 
   const session = event.data as ChampSelectSession
   if (!session?.myTeam) return
@@ -566,6 +816,11 @@ function cleanupInjectedDOM() {
     container.remove()
   })
   mountedRoots.length = 0
+
+  for (const ref of champSelectHiddenNameRefs) {
+    cleanupHiddenNameRef(ref)
+  }
+  champSelectHiddenNameRefs = []
 
   for (const ref of champSelectInjectedRefs) {
     ref.statsDiv.remove()
@@ -878,11 +1133,16 @@ export function initFeatures() {
   })
 
   const updateOpggLifecycle = () => {
-    updateOpggBuildRecommendation(store.get('opggBuildRecommendation') || store.get('smartBuildRecommendation'))
+    updateOpggBuildRecommendation(
+      store.get('opggBuildRecommendation')
+      || store.get('smartBuildRecommendation')
+      || store.get('smartItemSetBuild'),
+    )
   }
   updateOpggLifecycle()
   store.onChange('opggBuildRecommendation', updateOpggLifecycle)
   store.onChange('smartBuildRecommendation', updateOpggLifecycle)
+  store.onChange('smartItemSetBuild', updateOpggLifecycle)
 
   updateGlobalParticle(store.get('globalParticle'))
   store.onChange('globalParticle', updateGlobalParticle)
@@ -953,6 +1213,7 @@ export function initFeatures() {
 
   updateAutoBanChampion(store.get('autoBanChampion'))
   store.onChange('autoBanChampion', updateAutoBanChampion)
+  store.onChange('autoBanChampionIds', () => updateAutoBanChampion(store.get('autoBanChampion')))
 
   updateBalanceBuffTooltip(store.get('balanceBuffTooltip'))
   store.onChange('balanceBuffTooltip', updateBalanceBuffTooltip)

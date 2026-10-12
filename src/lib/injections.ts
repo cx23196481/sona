@@ -19,14 +19,38 @@ import type { Availability, ChatMe } from '@/lib/lcu'
 import { sleep } from '@/lib/utils'
 import { getPuuid } from '@/lib/assets'
 import { getUpdateState, onUpdateStateChange } from '@/lib/update-checker'
-import { stripAvatarStatusPayload } from '@/lib/features/beautify-client/avatar-status-sync'
+import {
+  decodeSonaStatusPayload,
+  embedSonaStatusPayload,
+  stripAvatarStatusPayload,
+} from '@/lib/features/beautify-client/avatar-status-sync'
 
 /** 通用标记：标识已被 Sona 接管的 DOM 元素，防止重复绑定 */
 const HIJACKED_ATTR = 'data-sona-hijacked'
 
+function replaceVisibleStatusPreservingSonaPayload(
+  currentStatusMessage: string | null | undefined,
+  visibleStatusMessage: string,
+): string {
+  const payload = decodeSonaStatusPayload(currentStatusMessage)
+  return payload ? embedSonaStatusPayload(visibleStatusMessage, payload) : visibleStatusMessage
+}
+
 // ==================== Sona 入口按钮 ====================
 
 const BUTTON_ID = 'sona-entry-btn'
+const BUTTON_HIDDEN_CLASS = 'sona-entry-btn--hidden'
+let entryButtonVisibilityUnsubscribe: (() => void) | null = null
+
+function applyEntryButtonVisibility(button: HTMLElement, hidden = store.get('hideSonaIcon')) {
+  button.classList.toggle(BUTTON_HIDDEN_CLASS, hidden)
+  button.setAttribute('aria-hidden', String(hidden))
+}
+
+function syncEntryButtonVisibility(hidden = store.get('hideSonaIcon')) {
+  const button = document.getElementById(BUTTON_ID)
+  if (button) applyEntryButtonVisibility(button, hidden)
+}
 
 /**
  * 创建 Sona 入口按钮 DOM 元素
@@ -35,6 +59,7 @@ function createEntryButton(): HTMLElement {
   const btn = document.createElement('div')
   btn.id = BUTTON_ID
   btn.className = 'sona-entry-btn'
+  applyEntryButtonVisibility(btn)
 
   btn.innerHTML = `
     <img class="sona-entry-icon" src="${sonaIcon}" alt="Sona" />
@@ -70,7 +95,11 @@ function createEntryButton(): HTMLElement {
  * 在 Play 按钮左侧注入，支持自愈（被刷掉后自动补回）
  */
 function tryInjectSonaButton(): boolean {
-  if (document.getElementById(BUTTON_ID)?.isConnected) return true
+  const existingButton = document.getElementById(BUTTON_ID)
+  if (existingButton?.isConnected) {
+    applyEntryButtonVisibility(existingButton)
+    return true
+  }
 
   const playButtonContainer = document.querySelector('.play-button-container')
   if (!playButtonContainer?.parentElement) return false
@@ -181,7 +210,7 @@ async function restoreAvailabilityAndStatus() {
     const clientStatus = hasContent(me.statusMessage) ? stripAvatarStatusPayload(me.statusMessage as string) : ''
     if (clientStatus === '' && hasContent(savedStatus)) {
       try {
-        await lcu.setStatusMessage(savedStatus)
+        await lcu.setStatusMessage(replaceVisibleStatusPreservingSonaPayload(me.statusMessage, savedStatus))
         logger.info('[Availability] 已写入 statusMessage: %s', savedStatus)
       } catch (err) {
         logger.warn('[Availability] statusMessage 写入失败（稍后会再校验一次）:', err)
@@ -251,7 +280,7 @@ async function verifyAvailabilitySnapshot(label: string) {
     // 校验 statusMessage
     if (hasContent(savedStatus) && clientStatus !== savedStatus) {
       logger.warn('[Availability] 延迟校验(%s)发现 statusMessage 被客户端回退（"%s" → "%s"），再次写入', label, savedStatus, clientStatus)
-      await lcu.setStatusMessage(savedStatus).catch((err) => {
+      await lcu.setStatusMessage(replaceVisibleStatusPreservingSonaPayload(me.statusMessage, savedStatus)).catch((err) => {
         logger.warn('[Availability] 延迟校验(%s)写 statusMessage 失败:', label, err)
       })
     }
@@ -542,6 +571,33 @@ function tryRemoveTFT(): boolean {
 let hideRightNavTextEnabled = false
 
 const NAV_TEXT_HIDDEN_ATTR = `${HIJACKED_ATTR}-nav-text`
+const NAV_TEXT_ELEMENT_HIDDEN_ATTR = `${NAV_TEXT_HIDDEN_ATTR}-element`
+
+function getRightNavTextElements(nav: Element): HTMLElement[] {
+  const textElements = new Set<HTMLElement>()
+
+  nav.querySelectorAll<HTMLElement>('.menu-item-small-text').forEach((text) => textElements.add(text))
+  nav.querySelectorAll('lol-uikit-navigation-item').forEach((item) => {
+    const shadowRoot = (item as HTMLElement).shadowRoot
+    shadowRoot?.querySelectorAll<HTMLElement>('.menu-item-small-text').forEach((text) => textElements.add(text))
+  })
+
+  return Array.from(textElements)
+}
+
+function restoreRightNavText() {
+  document.querySelectorAll('.right-nav-menu').forEach((nav) => {
+    const wasHiddenBySona = nav.hasAttribute(NAV_TEXT_HIDDEN_ATTR)
+    nav.removeAttribute(NAV_TEXT_HIDDEN_ATTR)
+
+    getRightNavTextElements(nav).forEach((text) => {
+      if (text.hasAttribute(NAV_TEXT_ELEMENT_HIDDEN_ATTR) || (wasHiddenBySona && text.style.display === 'none')) {
+        text.style.removeProperty('display')
+        text.removeAttribute(NAV_TEXT_ELEMENT_HIDDEN_ATTR)
+      }
+    })
+  })
+}
 
 /** 设置开关状态（供 features.ts 调用） */
 export function setHideRightNavTextEnabled(enabled: boolean) {
@@ -550,15 +606,7 @@ export function setHideRightNavTextEnabled(enabled: boolean) {
     injector.register(tryHideRightNavText)
   } else {
     injector.unregister(tryHideRightNavText)
-    // 恢复被隐藏的文字
-    const nav = document.querySelector('.right-nav-menu')
-    if (nav) {
-      nav.removeAttribute(NAV_TEXT_HIDDEN_ATTR)
-      nav.querySelectorAll('lol-uikit-navigation-item').forEach((item) => {
-        const text = (item as HTMLElement).querySelector('.menu-item-small-text') as HTMLElement | null
-        if (text) text.style.display = ''
-      })
-    }
+    restoreRightNavText()
   }
 }
 
@@ -569,23 +617,28 @@ export function setHideRightNavTextEnabled(enabled: boolean) {
 function tryHideRightNavText(): boolean {
   if (!hideRightNavTextEnabled) return true
 
-  const nav = document.querySelector('.right-nav-menu')
-  if (!nav || nav.hasAttribute(NAV_TEXT_HIDDEN_ATTR)) return true
+  const navs = document.querySelectorAll('.right-nav-menu')
+  if (navs.length === 0) return true
 
-  const navItems = nav.querySelectorAll('lol-uikit-navigation-item')
   let hiddenCount = 0
-  navItems.forEach((item) => {
-    const el = item as HTMLElement
-    const text = el.querySelector('.menu-item-small-text') as HTMLElement | null
-    if (text) {
-      text.style.display = 'none'
-      hiddenCount++
-      logger.info(`[HideRightNavText] Hide right nav text: ${el.textContent}`)
-    }
-  })
-  // 只有所有 item 都成功隐藏了 text 才打 tag，否则下帧继续尝试
-  if (hiddenCount > 0) {
+  navs.forEach((nav) => {
+    // 容器状态配合全局 CSS，可自动覆盖之后才由 Ember 创建的文字节点。
     nav.setAttribute(NAV_TEXT_HIDDEN_ATTR, 'true')
+
+    getRightNavTextElements(nav).forEach((text) => {
+      const alreadyHidden = text.hasAttribute(NAV_TEXT_ELEMENT_HIDDEN_ATTR)
+        && text.style.getPropertyValue('display') === 'none'
+        && text.style.getPropertyPriority('display') === 'important'
+      if (alreadyHidden) return
+
+      text.style.setProperty('display', 'none', 'important')
+      text.setAttribute(NAV_TEXT_ELEMENT_HIDDEN_ATTR, 'true')
+      hiddenCount++
+    })
+  })
+
+  if (hiddenCount > 0) {
+    logger.info('[HideRightNavText] 已隐藏或修复 %d 个右侧导航文字节点', hiddenCount)
   }
   return true
 }
@@ -598,6 +651,9 @@ function tryHideRightNavText(): boolean {
  */
 export function registerAllInjections() {
   injector.register(tryInjectSonaButton)
+  if (!entryButtonVisibilityUnsubscribe) {
+    entryButtonVisibilityUnsubscribe = store.onChange('hideSonaIcon', syncEntryButtonVisibility)
+  }
   // tryHijackAvailabilityHitbox 由 features.ts 的 unlockAvailability 开关按需注册
 
   // 状态同步启动顺序（重要！）：
@@ -622,5 +678,7 @@ export function registerAllInjections() {
 
 /** 供测试/清理用（实际不会调用，因为插件生命周期是进程级） */
 export function unregisterAllInjections() {
+  entryButtonVisibilityUnsubscribe?.()
+  entryButtonVisibilityUnsubscribe = null
   unsubscribeChatMeSync()
 }

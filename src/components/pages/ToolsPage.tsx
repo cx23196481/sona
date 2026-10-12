@@ -155,6 +155,7 @@ export function ToolsPage() {
   const [champSelectAssist, setChampSelectAssist] = useState(store.get('champSelectAssist'))
   const [opggBuildRecommendation, setOpggBuildRecommendation] = useState(store.get('opggBuildRecommendation'))
   const [smartBuildRecommendation, setSmartBuildRecommendation] = useState(store.get('smartBuildRecommendation'))
+  const [smartItemSetBuild, setSmartItemSetBuild] = useState(store.get('smartItemSetBuild'))
   const [balanceBuffTooltip, setBalanceBuffTooltip] = useState(store.get('balanceBuffTooltip'))
   const [champSelectQuitButton, setChampSelectQuitButton] = useState(store.get('champSelectQuitButton'))
   const [gameAnalysisPopup, setGameAnalysisPopup] = useState(store.get('gameAnalysisPopup'))
@@ -174,6 +175,7 @@ export function ToolsPage() {
   const [customProfileBg, setCustomProfileBg] = useState(store.get('customProfileBg'))
   const [customBanner, setCustomBanner] = useState(store.get('customBanner'))
   const [isRemovingCrest, setIsRemovingCrest] = useState(false)
+  const [isRemovingChallengeBadges, setIsRemovingChallengeBadges] = useState(false)
   const [rankQueue, setRankQueue] = useState(store.get('rankQueue'))
   const [rankTier, setRankTier] = useState(store.get('rankTier'))
   const [rankDivision, setRankDivision] = useState(store.get('rankDivision'))
@@ -236,6 +238,7 @@ export function ToolsPage() {
       store.onChange('champSelectAssist', setChampSelectAssist),
       store.onChange('opggBuildRecommendation', setOpggBuildRecommendation),
       store.onChange('smartBuildRecommendation', setSmartBuildRecommendation),
+      store.onChange('smartItemSetBuild', setSmartItemSetBuild),
       store.onChange('balanceBuffTooltip', setBalanceBuffTooltip),
       store.onChange('champSelectQuitButton', setChampSelectQuitButton),
       store.onChange('gameAnalysisPopup', setGameAnalysisPopup),
@@ -385,6 +388,20 @@ export function ToolsPage() {
       logger.error('卸下头像边框失败:', err)
     } finally {
       setIsRemovingCrest(false)
+    }
+  }
+
+  const handleRemoveChallengeBadges = async () => {
+    if (isRemovingChallengeBadges) return
+
+    try {
+      setIsRemovingChallengeBadges(true)
+      await lcu.updateChallengePlayerPreferences({ challengeIds: [] })
+      logger.info('身份徽章已全部卸下 ✓')
+    } catch (err) {
+      logger.error('卸下身份徽章失败:', err)
+    } finally {
+      setIsRemovingChallengeBadges(false)
     }
   }
 
@@ -559,6 +576,15 @@ export function ToolsPage() {
           <SonaSwitch
             checked={smartBuildRecommendation}
             onChange={(v) => { setSmartBuildRecommendation(v); store.set('smartBuildRecommendation', v) }}
+          />
+        </SettingCard>
+        <SettingCard
+          title={t('tools.smartItemSetBuild.title')}
+          description={t('tools.smartItemSetBuild.description')}
+        >
+          <SonaSwitch
+            checked={smartItemSetBuild}
+            onChange={(v) => { setSmartItemSetBuild(v); store.set('smartItemSetBuild', v) }}
           />
         </SettingCard>
         <SettingCard
@@ -763,6 +789,14 @@ export function ToolsPage() {
           description={t('tools.removeCrest.description')}
         >
           <SonaButton onClick={handleRemoveCrest} disabled={isRemovingCrest}>
+            {t('tools.unequip')}
+          </SonaButton>
+        </SettingCard>
+        <SettingCard
+          title={t('tools.removeChallengeBadges.title')}
+          description={t('tools.removeChallengeBadges.description')}
+        >
+          <SonaButton onClick={handleRemoveChallengeBadges} disabled={isRemovingChallengeBadges}>
             {t('tools.unequip')}
           </SonaButton>
         </SettingCard>

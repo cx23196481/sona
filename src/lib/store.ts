@@ -47,6 +47,8 @@ export interface SonaConfig {
   statusMessage: Record<string, string>
   /** 面板快捷键 */
   hotkey: string
+  /** 隐藏 Play 按钮旁的 Sona 入口图标 */
+  hideSonaIcon: boolean
   /** 界面语言：auto=跟随客户端 html lang */
   locale: 'auto' | 'zh-CN' | 'en-US'
   /** 已跳过提醒的 Sona 版本号 */
@@ -57,8 +59,15 @@ export interface SonaConfig {
   champSelectAssist: boolean
   /** OP.GG 配装推荐（接管选好英雄后的技能预览面板点击） */
   opggBuildRecommendation: boolean
-  /** 智能配装（后续扩展符文、召唤师技能持久化） */
+  /**
+   * 自动配置符文 & 召唤师技能：按"英雄 + 模式"保存并恢复
+   *
+   * 注：key 名是历史遗留（原先符文与配装共用一个开关），自动配装已拆到
+   * `smartItemSetBuild`；沿用旧 key 是为了不打断老用户已经在用的符文功能。
+   */
   smartBuildRecommendation: boolean
+  /** 自动配装：锁定英雄后按 OP.GG 推荐写入装备集 */
+  smartItemSetBuild: boolean
   /** 智能符文：按英雄与模式保存的用户符文页 */
   smartRunePages: Record<string, {
     primaryStyleId: number
@@ -227,12 +236,14 @@ const DEFAULT_CONFIG: SonaConfig = {
   availability: 'chat',
   statusMessage: {},
   hotkey: 'F1',
+  hideSonaIcon: false,
   locale: 'auto',
   skippedUpdateVersion: null,
   windowEffect: 'none',
   champSelectAssist: false,
   opggBuildRecommendation: false,
-  smartBuildRecommendation: true,
+  smartBuildRecommendation: false,
+  smartItemSetBuild: false,
   smartRunePages: {},
   smartSummonerSpells: {},
   gameSettingsBackups: {},
